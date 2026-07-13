@@ -1,15 +1,22 @@
 """
-AIFormBotV2 — Phase 1 entry point.
+AIFormBotV2 — entry point.
 
-Execution flow:
+Phase 1 flow:
   1. Connect to the MPF Form Filling window.
   2. Bring it to the foreground.
-  3. Find the root panel 'MPF (Form Filling Page)'.
+  3. Find the root panel 'MPF (Form Filling Page)' (deep search, falls back
+     to window root if missing).
   4. Print window metadata to stdout.
   5. Recursively enumerate all descendants.
-  6. Export control tree → debug/ui_tree.json and debug/ui_tree.txt.
-  7. Capture screen and draw bounding-box overlay → debug/ui_overlay.png.
-  8. Exit.
+  6. Export full control tree → debug/ui_tree.json and debug/ui_tree.txt.
+  7. Capture screen and draw generic bounding-box overlay → debug/ui_overlay.png.
+
+Phase 2 flow (runs immediately after Phase 1):
+  8.  Build the field map — extract every input control and resolve its label.
+  9.  Log type totals.
+  10. Validate — duplicate ids, missing labels, duplicate labels.
+  11. Export field map → debug/control_map.json and debug/control_map.csv.
+  12. Save color-coded overlay → debug/control_map_overlay.png.
 """
 
 import sys
@@ -17,21 +24,28 @@ import sys
 from loguru import logger
 
 from config.settings import (
+    CONTROL_MAP_CSV,
+    CONTROL_MAP_JSON,
+    CONTROL_MAP_OVERLAY_PNG,
+    DEBUG_DIR,
     LOG_FILE,
     LOG_LEVEL,
     LOG_RETENTION,
     LOG_ROTATION,
     LOGS_DIR,
-    DEBUG_DIR,
+    ROOT_CONTROL_NAME,
     UI_OVERLAY_PNG,
     UI_TREE_JSON,
     UI_TREE_TXT,
 )
 from ui.finder import bring_to_foreground, wait_for_window
 from ui.inspector import find_root_panel, flatten_tree, inspect_tree
+from ui.field_mapper import build_field_map, log_totals
 from automation.exporter import save_json, save_txt
 from automation.overlay import save_overlay
-from config.settings import ROOT_CONTROL_NAME
+from automation.map_exporter import save_map_json, save_map_csv
+from automation.map_overlay import save_map_overlay
+from automation.validator import validate_field_map
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -59,7 +73,9 @@ def _configure_logging() -> None:
     )
 
 
-# ── Phase steps ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1 steps
+# ══════════════════════════════════════════════════════════════════════════════
 
 def step_connect():
     """Step 1-2: Find window and bring to foreground."""
@@ -71,7 +87,7 @@ def step_connect():
 
 def step_find_root(window):
     """
-    Step 3-4: Search the full descendant tree for the expected root panel.
+    Step 3-4: Deep-search the full descendant tree for the expected root panel.
 
     If found   — use it as the inspection root and print its metadata.
     If missing — log a warning and fall back to the window itself so the
@@ -84,7 +100,6 @@ def step_find_root(window):
             "'{}' not found — exporting the entire window tree instead.",
             ROOT_CONTROL_NAME,
         )
-        # Fall back to the window so exports always succeed
         root_panel = window
     else:
         logger.info("Root panel found")
@@ -112,30 +127,68 @@ def step_inspect(root_panel):
     return tree
 
 
-def step_export(tree) -> None:
-    """Step 6: Save control tree to JSON and TXT."""
+def step_export_tree(tree) -> None:
+    """Step 6: Save full control tree to JSON and TXT."""
     save_json(tree, UI_TREE_JSON)
     save_txt(tree, UI_TREE_TXT)
 
 
-def step_overlay(tree) -> None:
-    """Step 7: Draw bounding-box overlay and save PNG."""
+def step_generic_overlay(tree) -> None:
+    """Step 7: Draw generic bounding-box overlay and save PNG."""
     save_overlay(tree, UI_OVERLAY_PNG)
     logger.info("Overlay image saved")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2 steps
+# ══════════════════════════════════════════════════════════════════════════════
+
+def step_build_field_map(tree):
+    """Step 8-9: Extract input controls, resolve labels, log type totals."""
+    entries = build_field_map(tree)
+    log_totals(entries)
+    return entries
+
+
+def step_validate(entries) -> None:
+    """Step 10: Validate field map — log warnings, never abort."""
+    validate_field_map(entries)
+
+
+def step_export_map(entries) -> None:
+    """Step 11: Save field map to JSON and CSV."""
+    save_map_json(entries, CONTROL_MAP_JSON)
+    save_map_csv(entries, CONTROL_MAP_CSV)
+
+
+def step_map_overlay(entries) -> None:
+    """Step 12: Save color-coded control-map overlay PNG."""
+    save_map_overlay(entries, CONTROL_MAP_OVERLAY_PNG)
+    logger.info("Control map overlay saved")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     _configure_logging()
-    logger.info("AIFormBotV2 Phase 1 starting.")
+    logger.info("AIFormBotV2 starting.")
 
     try:
-        window = step_connect()
+        # ── Phase 1 ───────────────────────────────────────────────────────────
+        window     = step_connect()
         root_panel = step_find_root(window)
-        tree = step_inspect(root_panel)
-        step_export(tree)
-        step_overlay(tree)
+        tree       = step_inspect(root_panel)
+        step_export_tree(tree)
+        step_generic_overlay(tree)
+
+        # ── Phase 2 ───────────────────────────────────────────────────────────
+        entries = step_build_field_map(tree)
+        step_validate(entries)
+        step_export_map(entries)
+        step_map_overlay(entries)
+
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unexpected error: {}", exc)
         sys.exit(1)
