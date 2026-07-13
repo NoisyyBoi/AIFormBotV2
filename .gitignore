@@ -17,6 +17,7 @@ env/
 # Generated output — do not commit
 debug/
 logs/
+output/
 
 # IDE
 .vscode/

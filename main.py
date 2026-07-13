@@ -17,6 +17,12 @@ Phase 2 flow (runs immediately after Phase 1):
   10. Validate — duplicate ids, missing labels, duplicate labels.
   11. Export field map → debug/control_map.json and debug/control_map.csv.
   12. Save color-coded overlay → debug/control_map_overlay.png.
+
+Phase 3 flow (runs immediately after Phase 2):
+  13. Detect left information panel from the UI tree.
+  14. Scroll through the entire panel, OCR-ing each visible section.
+  15. Parse and merge all label/value pairs (latest value wins on duplicates).
+  16. Save merged data → output/form_data.json and output/form_data.txt.
 """
 
 import sys
@@ -28,11 +34,14 @@ from config.settings import (
     CONTROL_MAP_JSON,
     CONTROL_MAP_OVERLAY_PNG,
     DEBUG_DIR,
+    FORM_DATA_JSON,
+    FORM_DATA_TXT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_RETENTION,
     LOG_ROTATION,
     LOGS_DIR,
+    OUTPUT_DIR,
     ROOT_CONTROL_NAME,
     UI_OVERLAY_PNG,
     UI_TREE_JSON,
@@ -46,6 +55,7 @@ from automation.overlay import save_overlay
 from automation.map_exporter import save_map_json, save_map_csv
 from automation.map_overlay import save_map_overlay
 from automation.validator import validate_field_map
+from automation.left_panel_reader import read_left_panel, save_read_result
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -54,6 +64,7 @@ def _configure_logging() -> None:
     """Remove the default sink and add a console + rotating file sink."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     logger.remove()  # drop default stderr sink
 
@@ -168,6 +179,51 @@ def step_map_overlay(entries) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Phase 3 steps
+# ══════════════════════════════════════════════════════════════════════════════
+
+def step_read_left_panel(tree):
+    """
+    Step 13-15: Detect left panel, scroll + OCR, parse and merge all
+    label/value pairs.  Never aborts the run — logs warnings on partial
+    or empty results.
+    """
+    result = read_left_panel(tree)
+
+    if not result.panel_found:
+        logger.warning(
+            "Phase 3: left panel not detected — "
+            "form_data files will be empty."
+        )
+    elif not result.success:
+        logger.warning(
+            "Phase 3: OCR produced no parseable pairs — "
+            "form_data files will be empty. "
+            "Verify Tesseract is installed and TESSERACT_CMD is correct."
+        )
+    else:
+        logger.info(
+            "Phase 3 complete: {} fields read in {:.2f}s "
+            "(mean OCR confidence {:.1f}).",
+            result.total_fields,
+            result.total_elapsed_s,
+            result.mean_confidence,
+        )
+
+    return result
+
+
+def step_save_form_data(result) -> None:
+    """Step 16: Persist form data to output/form_data.json and .txt."""
+    save_read_result(result)
+    logger.info(
+        "Form data saved → {}  and  {}",
+        FORM_DATA_JSON,
+        FORM_DATA_TXT,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -188,6 +244,10 @@ def main() -> None:
         step_validate(entries)
         step_export_map(entries)
         step_map_overlay(entries)
+
+        # ── Phase 3 ───────────────────────────────────────────────────────────
+        result = step_read_left_panel(tree)
+        step_save_form_data(result)
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unexpected error: {}", exc)

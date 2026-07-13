@@ -86,3 +86,49 @@ MAP_OVERLAY_RECT_THICKNESS: int = 2
 MAP_OVERLAY_FONT_SCALE: float = 0.38
 MAP_OVERLAY_FONT_THICKNESS: int = 1
 MAP_OVERLAY_LABEL_COLOR: tuple[int, int, int] = (255, 255, 255)   # white text
+
+# =============================================================================
+# Phase 3 — Left Panel Reader
+# =============================================================================
+
+# ── Output directory and files ────────────────────────────────────────────────
+OUTPUT_DIR: Path = BASE_DIR / "output"
+FORM_DATA_JSON: Path = OUTPUT_DIR / "form_data.json"
+FORM_DATA_TXT: Path = OUTPUT_DIR / "form_data.txt"
+
+# ── Tesseract ─────────────────────────────────────────────────────────────────
+# Default Windows install path. Change if Tesseract is installed elsewhere.
+TESSERACT_CMD: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Tesseract page-segmentation mode:
+#   --psm 6  = Assume a single uniform block of text  (good for form panels)
+#   --oem 3  = Default engine (LSTM + legacy)
+TESSERACT_CONFIG: str = "--psm 6 --oem 3"
+
+# ── OCR quality ───────────────────────────────────────────────────────────────
+# Scale factor applied to the captured image before OCR (>1 upscales).
+OCR_SCALE_FACTOR: float = 2.0
+
+# Mean word confidence below this value triggers a warning log (0–100).
+OCR_CONFIDENCE_THRESHOLD: float = 50.0
+
+# ── Scroll behaviour ──────────────────────────────────────────────────────────
+# Number of wheel clicks sent per scroll step.
+SCROLL_CLICKS_PER_STEP: int = 3
+
+# Pause (seconds) after each scroll step to let the panel repaint.
+SCROLL_PAUSE_S: float = 0.4
+
+# Maximum scroll iterations before giving up (safety cap).
+SCROLL_MAX_ITERATIONS: int = 100
+
+# ── Label / value parsing ─────────────────────────────────────────────────────
+# Separator patterns tried in order when splitting a line into label : value.
+# Each entry is a plain string that is split on once (from the left).
+LABEL_VALUE_SEPARATORS: list[str] = [":", "=", "\t"]
+
+# Minimum label length (chars) — shorter strings are discarded as noise.
+LABEL_MIN_LENGTH: int = 2
+
+# Maximum label length (chars) — longer strings are treated as plain text, not labels.
+LABEL_MAX_LENGTH: int = 60
