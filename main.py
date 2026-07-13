@@ -31,6 +31,7 @@ from ui.finder import bring_to_foreground, wait_for_window
 from ui.inspector import find_root_panel, flatten_tree, inspect_tree
 from automation.exporter import save_json, save_txt
 from automation.overlay import save_overlay
+from config.settings import ROOT_CONTROL_NAME
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -69,8 +70,24 @@ def step_connect():
 
 
 def step_find_root(window):
-    """Step 3-4: Find root panel and print its metadata."""
+    """
+    Step 3-4: Search the full descendant tree for the expected root panel.
+
+    If found   — use it as the inspection root and print its metadata.
+    If missing — log a warning and fall back to the window itself so the
+                 full tree is still exported (never terminates on missing panel).
+    """
     root_panel = find_root_panel(window)
+
+    if root_panel is None:
+        logger.warning(
+            "'{}' not found — exporting the entire window tree instead.",
+            ROOT_CONTROL_NAME,
+        )
+        # Fall back to the window so exports always succeed
+        root_panel = window
+    else:
+        logger.info("Root panel found")
 
     rect = root_panel.BoundingRectangle
     print()
@@ -84,7 +101,6 @@ def step_find_root(window):
     print("=" * 60)
     print()
 
-    logger.info("Root panel found")
     return root_panel
 
 
@@ -120,9 +136,6 @@ def main() -> None:
         tree = step_inspect(root_panel)
         step_export(tree)
         step_overlay(tree)
-    except RuntimeError as exc:
-        logger.error("Fatal: {}", exc)
-        sys.exit(1)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unexpected error: {}", exc)
         sys.exit(1)

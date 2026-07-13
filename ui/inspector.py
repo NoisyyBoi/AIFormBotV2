@@ -2,7 +2,7 @@
 Recursive UI-tree inspector.
 
 Responsibilities:
-  - Locate the root panel by Name inside a given window.
+  - Locate the root panel by Name anywhere in the descendant tree.
   - Walk every descendant up to MAX_TREE_DEPTH.
   - Return a list of ControlInfo dataclasses (one per node).
 """
@@ -116,23 +116,74 @@ def _walk(control: auto.Control, depth: int) -> ControlInfo:
     return node
 
 
+def _search_descendant(
+    control: auto.Control,
+    name: str,
+    depth: int,
+) -> Optional[tuple[auto.Control, int]]:
+    """
+    Depth-first search for the first control whose Name equals *name*.
+    Returns a (control, depth) tuple, or None if not found.
+    Stops descending beyond MAX_TREE_DEPTH.
+    """
+    if (control.Name or "").strip() == name.strip():
+        return control, depth
+
+    if depth >= MAX_TREE_DEPTH:
+        return None
+
+    try:
+        children = control.GetChildren()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Cannot get children at depth {} during search: {}", depth, exc)
+        return None
+
+    for child in children:
+        try:
+            result = _search_descendant(child, name, depth + 1)
+            if result is not None:
+                return result
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Error searching child at depth {}: {}", depth + 1, exc)
+
+    return None
+
+
 def find_root_panel(
     window: auto.WindowControl,
     name: str = ROOT_CONTROL_NAME,
-) -> auto.Control:
+) -> Optional[auto.Control]:
     """
-    Search immediate children of *window* for a control whose Name matches *name*.
-    Raises RuntimeError if not found.
-    """
-    logger.debug("Searching for root panel named '{}'.", name)
-    for child in window.GetChildren():
-        if (child.Name or "").strip() == name.strip():
-            logger.info("Root panel found: '{}'", child.Name)
-            return child
+    Recursively search the entire descendant tree of *window* for a control
+    whose Name equals *name*.
 
-    raise RuntimeError(
-        f"Control named '{name}' not found as a direct child of '{window.Name}'."
+    Returns the control on success and logs its location.
+    Returns None (does NOT raise) if the control is not found — callers must
+    handle the missing-panel case gracefully.
+    """
+    logger.debug("Searching full descendant tree for panel named '{}'.", name)
+    result = _search_descendant(window, name, depth=0)
+
+    if result is None:
+        logger.warning(
+            "Control named '{}' was NOT found anywhere in the tree of '{}'.",
+            name,
+            window.Name,
+        )
+        return None
+
+    control, found_depth = result
+    rect = control.BoundingRectangle
+    logger.info("Root panel found at depth {}:", found_depth)
+    logger.info("  Name          : {}", control.Name)
+    logger.info("  ControlType   : {}", control.ControlTypeName)
+    logger.info("  AutomationId  : {}", control.AutomationId or "(none)")
+    logger.info("  ClassName     : {}", control.ClassName or "(none)")
+    logger.info(
+        "  BoundingRect  : ({}, {}, {}, {})",
+        rect.left, rect.top, rect.right, rect.bottom,
     )
+    return control
 
 
 def inspect_tree(root: auto.Control) -> ControlInfo:
