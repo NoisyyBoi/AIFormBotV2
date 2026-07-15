@@ -46,6 +46,7 @@ from config.settings import (
     LABEL_MAX_LENGTH,
     LABEL_MIN_LENGTH,
     LABEL_VALUE_SEPARATORS,
+    OCR_BOTTOM_CROP_PERCENT,
     SCROLL_CLICK_POSITIONS,
     SCROLL_CLICKS_PER_STEP,
     SCROLL_FAIL_DEBUG_DIR,
@@ -140,6 +141,41 @@ def _save_image(rect: BoundingRect, path: Path) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Bottom crop — strips Shift Details / countdown timer
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_bottom_crop(rect: BoundingRect) -> BoundingRect:
+    """
+    Discard the bottom OCR_BOTTOM_CROP_PERCENT of *rect*.
+
+    This removes the Shift Details section and countdown timer so they cannot
+    contaminate OCR output or cause false-positive hash changes.
+
+    Returns a new BoundingRect with the same left/top/right but a reduced
+    bottom edge.  If the crop would produce zero or negative height the
+    original rect is returned unchanged with a warning.
+    """
+    pixels_to_remove = int(rect.height * OCR_BOTTOM_CROP_PERCENT)
+    new_bottom = rect.bottom - pixels_to_remove
+
+    if new_bottom <= rect.top:
+        logger.warning(
+            "Bottom crop of {:.0%} would eliminate the entire rect — "
+            "keeping original rect ({},{},{},{}).",
+            OCR_BOTTOM_CROP_PERCENT,
+            rect.left, rect.top, rect.right, rect.bottom,
+        )
+        return rect
+
+    return BoundingRect(
+        left=rect.left,
+        top=rect.top,
+        right=rect.right,
+        bottom=new_bottom,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Click position resolution
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -219,13 +255,20 @@ def _attempt_scroll_step(
 # Core read loop
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _read_sections(ocr_rect: BoundingRect) -> tuple[list[SectionResult], str]:
+def _read_sections(
+    ocr_rect: BoundingRect,
+    original_rect: BoundingRect,
+) -> tuple[list[SectionResult], str]:
     """
     Scroll through the left panel from top to bottom, OCR-ing each view.
 
-    Uses only the OCR rect for both capture and scroll targeting:
-      - Hash is computed from the OCR rect (tight content region).
-      - Click positions are resolved within the OCR rect.
+    Parameters
+    ----------
+    ocr_rect      Cropped rect (Shift Details / timer stripped).
+                  Used for OCR, SHA-256 hashing, debug screenshots, and
+                  click-position resolution.
+    original_rect Full rect before bottom crop — passed to save_crop_overlay
+                  so the overlay shows both rectangles.
 
     Termination conditions (first that fires):
       A. All SCROLL_CLICK_POSITIONS failed to change the hash for
@@ -238,11 +281,11 @@ def _read_sections(ocr_rect: BoundingRect) -> tuple[list[SectionResult], str]:
 
     for i in range(SCROLL_MAX_ITERATIONS):
 
-        # ── Save overlay on first iteration ───────────────────────────────────
+        # ── Save overlay on first iteration (shows both rects) ────────────────
         if i == 0:
-            save_crop_overlay(ocr_rect)
+            save_crop_overlay(original_rect, ocr_rect)
 
-        # ── Save raw crop for this position ───────────────────────────────────
+        # ── Save raw crop for this position (cropped rect only) ───────────────
         save_section_crop(ocr_rect, i)
 
         # ── OCR ───────────────────────────────────────────────────────────────
@@ -364,13 +407,28 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
     # ── 2. Derive tight OCR crop rect ─────────────────────────────────────────
     ocr_rect = compute_content_rect(panel_node)
     logger.info(
-        "OCR crop rect: ({},{},{},{})  size={}x{}",
+        "Original OCR rect : ({},{},{},{})  size={}x{}",
         ocr_rect.left, ocr_rect.top, ocr_rect.right, ocr_rect.bottom,
         ocr_rect.width, ocr_rect.height,
     )
 
+    # ── 2b. Strip bottom section (Shift Details / countdown timer) ────────────
+    active_rect = _apply_bottom_crop(ocr_rect)
+    logger.info(
+        "Cropped OCR rect  : ({},{},{},{})  size={}x{}  "
+        "(bottom {:.0%} removed, hash image {}x{}px)",
+        active_rect.left, active_rect.top,
+        active_rect.right, active_rect.bottom,
+        active_rect.width, active_rect.height,
+        OCR_BOTTOM_CROP_PERCENT,
+        active_rect.width, active_rect.height,
+    )
+    logger.info("Crop percentage   : {:.0%}", OCR_BOTTOM_CROP_PERCENT)
+
     # ── 3. Scroll + OCR ───────────────────────────────────────────────────────
-    sections, stop_reason = _read_sections(ocr_rect)
+    # active_rect is used for OCR, SHA-256 hashing, and debug screenshots.
+    # ocr_rect is passed to save_crop_overlay only so the overlay shows both.
+    sections, stop_reason = _read_sections(active_rect, ocr_rect)
 
     # ── 4. Aggregate confidence ───────────────────────────────────────────────
     successful = [s for s in sections if s.ocr.success]

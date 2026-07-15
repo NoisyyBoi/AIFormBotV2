@@ -164,6 +164,12 @@ CROP_PADDING: int = 6
 # panel locator picks a container that spans both halves.
 CROP_MAX_WIDTH_FRACTION: float = 0.52   # use at most 52 % of panel width
 
+# ── Bottom crop — strips Shift Details / countdown timer ─────────────────────
+# Fraction of the OCR rect height to discard from the BOTTOM before OCR,
+# hashing, and debug screenshots.
+# 0.25 = ignore the bottom 25 %.  Increase if the timer still bleeds in.
+OCR_BOTTOM_CROP_PERCENT: float = 0.25
+
 # =============================================================================
 # Phase 3.2 — Scroll target debug images
 # =============================================================================
