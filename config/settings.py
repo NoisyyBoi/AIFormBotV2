@@ -172,3 +172,9 @@ SCROLL_DEBUG_LEFT_BEFORE:  Path = DEBUG_DIR / "left_before_scroll.png"
 SCROLL_DEBUG_LEFT_AFTER:   Path = DEBUG_DIR / "left_after_scroll.png"
 SCROLL_DEBUG_RIGHT_BEFORE: Path = DEBUG_DIR / "right_before_scroll.png"
 SCROLL_DEBUG_RIGHT_AFTER:  Path = DEBUG_DIR / "right_after_scroll.png"
+
+# =============================================================================
+# Scroll Inspection (diagnostic phase — no scrolling performed)
+# =============================================================================
+SCROLLABLE_CONTROLS_JSON:        Path = DEBUG_DIR / "scrollable_controls.json"
+SCROLLABLE_CONTROLS_OVERLAY_PNG: Path = DEBUG_DIR / "scrollable_controls_overlay.png"
