@@ -178,3 +178,27 @@ SCROLL_DEBUG_RIGHT_AFTER:  Path = DEBUG_DIR / "right_after_scroll.png"
 # =============================================================================
 SCROLLABLE_CONTROLS_JSON:        Path = DEBUG_DIR / "scrollable_controls.json"
 SCROLLABLE_CONTROLS_OVERLAY_PNG: Path = DEBUG_DIR / "scrollable_controls_overlay.png"
+
+# =============================================================================
+# Phase 3.3 — Click-to-focus + wheel scroll
+# =============================================================================
+
+# Fractional (x, y) positions within the OCR rect tried in order on failure.
+# (0.5, 0.5) = centre; (0.35, 0.5) = 35% from left; etc.
+# The last entry targets the far-right edge where a scrollbar may sit.
+SCROLL_CLICK_POSITIONS: list[tuple[float, float]] = [
+    (0.50, 0.50),   # centre
+    (0.35, 0.50),   # 35 % from left
+    (0.65, 0.50),   # 65 % from left
+    (0.92, 0.50),   # near right edge / scrollbar column
+]
+
+# Number of consecutive full-cycle failures (all positions exhausted without
+# any hash change) before the scroll loop gives up.
+SCROLL_MAX_CONSECUTIVE_FAILURES: int = 2
+
+# Debug images for failed scroll attempts are saved here.
+SCROLL_FAIL_DEBUG_DIR: Path = DEBUG_DIR / "scroll_failures"
+
+# Pause (seconds) between click and wheel event within one attempt.
+SCROLL_CLICK_PAUSE_S: float = 0.15

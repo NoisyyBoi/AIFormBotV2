@@ -18,12 +18,13 @@ Phase 2 flow (runs immediately after Phase 1):
   11. Export field map → debug/control_map.json and debug/control_map.csv.
   12. Save color-coded overlay → debug/control_map_overlay.png.
 
-Scroll Inspection flow (runs after Phase 2, then exits):
-  13. Walk the live UIA tree from the root panel.
-  14. Probe every control for ScrollPattern and scrollbar children.
-  15. Export → debug/scrollable_controls.json.
-  16. Draw annotated overlay → debug/scrollable_controls_overlay.png.
-  17. Exit — no scrolling, no OCR, no form interaction.
+Phase 3 flow (runs immediately after Phase 2):
+  13. Detect left information panel from the UI tree.
+  14. Scroll through the panel using click-to-focus + mouse-wheel input
+      (pyautogui primary, SendInput + win32 fallback).
+  15. OCR each visible section, parse label/value pairs.
+  16. Merge all pairs (latest value wins on duplicates).
+  17. Save merged data → output/form_data.json and output/form_data.txt.
 """
 
 import sys
@@ -36,6 +37,8 @@ from config.settings import (
     CONTROL_MAP_JSON,
     CONTROL_MAP_OVERLAY_PNG,
     DEBUG_DIR,
+    FORM_DATA_JSON,
+    FORM_DATA_TXT,
     LOG_FILE,
     LOG_LEVEL,
     LOG_RETENTION,
@@ -43,8 +46,6 @@ from config.settings import (
     LOGS_DIR,
     OUTPUT_DIR,
     ROOT_CONTROL_NAME,
-    SCROLLABLE_CONTROLS_JSON,
-    SCROLLABLE_CONTROLS_OVERLAY_PNG,
     UI_OVERLAY_PNG,
     UI_TREE_JSON,
     UI_TREE_TXT,
@@ -57,8 +58,7 @@ from automation.overlay import save_overlay
 from automation.map_exporter import save_map_json, save_map_csv
 from automation.map_overlay import save_map_overlay
 from automation.validator import validate_field_map
-from automation.scroll_inspector import inspect_scroll_candidates
-from automation.scroll_overlay import save_scroll_overlay
+from automation.left_panel_reader import read_left_panel, save_read_result
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -99,15 +99,11 @@ def step_connect():
     return window
 
 
-def step_find_root(window) -> tuple[auto.Control, object]:
+def step_find_root(window):
     """
     Step 3-4: Deep-search the full descendant tree for the expected root panel.
-
-    Returns (live_root_control, window) so that:
-      - The live control can be passed directly to the scroll inspector.
-      - The window is available for metadata printing.
-
-    If the root panel is not found, falls back to the window itself.
+    Returns the live uiautomation control (used for both snapshot and Phase 3).
+    Falls back to the window itself if the root panel is not found.
     """
     root_panel = find_root_panel(window)
 
@@ -184,29 +180,46 @@ def step_map_overlay(entries) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Scroll Inspection steps  (no scrolling performed)
+# Phase 3 steps
 # ══════════════════════════════════════════════════════════════════════════════
 
-def step_inspect_scroll_candidates(live_root: auto.Control) -> None:
+def step_read_left_panel(tree):
     """
-    Step 13-16: Walk the live UIA tree, probe every control for scroll
-    capability, export JSON + annotated overlay, then return.
+    Step 13-16: Detect left panel, scroll + OCR using click-to-focus wheel
+    input, parse and merge all label/value pairs.
+    Never aborts the run — logs warnings on partial or empty results.
+    """
+    result = read_left_panel(tree)
 
-    Accepts the LIVE uiautomation control (not the ControlInfo snapshot) so
-    that UIA automation patterns (ScrollPattern) are accessible.
-    Does NOT scroll, click, or modify anything.
-    """
-    logger.info("Starting scroll candidate inspection.")
-    candidates = inspect_scroll_candidates(live_root)
-    save_scroll_overlay(candidates, SCROLLABLE_CONTROLS_OVERLAY_PNG)
+    if not result.panel_found:
+        logger.warning(
+            "Phase 3: left panel not detected — form_data files will be empty."
+        )
+    elif not result.success:
+        logger.warning(
+            "Phase 3: OCR produced no parseable pairs — "
+            "form_data files will be empty. "
+            "Verify Tesseract is installed and TESSERACT_CMD is correct."
+        )
+    else:
+        logger.info(
+            "Phase 3 complete: {} fields read in {:.2f}s "
+            "(mean OCR confidence {:.1f}).",
+            result.total_fields,
+            result.total_elapsed_s,
+            result.mean_confidence,
+        )
+
+    return result
+
+
+def step_save_form_data(result) -> None:
+    """Step 17: Persist form data to output/form_data.json and .txt."""
+    save_read_result(result)
     logger.info(
-        "Scroll inspection complete — {} controls enumerated.",
-        len(candidates),
-    )
-    logger.info(
-        "Outputs: {}  |  {}",
-        SCROLLABLE_CONTROLS_JSON,
-        SCROLLABLE_CONTROLS_OVERLAY_PNG,
+        "Form data saved → {}  and  {}",
+        FORM_DATA_JSON,
+        FORM_DATA_TXT,
     )
 
 
@@ -220,9 +233,9 @@ def main() -> None:
 
     try:
         # ── Phase 1 ───────────────────────────────────────────────────────────
-        window     = step_connect()
-        live_root  = step_find_root(window)   # live uiautomation control
-        tree       = step_inspect(live_root)  # ControlInfo snapshot
+        window    = step_connect()
+        live_root = step_find_root(window)
+        tree      = step_inspect(live_root)
         step_export_tree(tree)
         step_generic_overlay(tree)
 
@@ -232,8 +245,9 @@ def main() -> None:
         step_export_map(entries)
         step_map_overlay(entries)
 
-        # ── Scroll Inspection ─────────────────────────────────────────────────
-        step_inspect_scroll_candidates(live_root)
+        # ── Phase 3 ───────────────────────────────────────────────────────────
+        result = step_read_left_panel(tree)
+        step_save_form_data(result)
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unexpected error: {}", exc)

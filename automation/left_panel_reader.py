@@ -3,17 +3,30 @@ Phase 3 — Left Panel Reader.
 
 Responsibilities:
   - Detect the left information panel from the existing ControlInfo tree.
-  - Scroll through the entire panel one step at a time.
+  - Scroll through the entire panel one step at a time using click-to-focus
+    + mouse-wheel input (no UIA ScrollPattern required).
   - OCR each visible section.
   - Parse every OCR result into label/value pairs.
   - Merge all sections into one dictionary (latest value wins on duplicate keys).
   - Return a ReadResult containing the merged data and rich diagnostics.
 
+Scroll strategy
+  For each scroll step:
+    1. Hash the OCR region BEFORE scrolling.
+    2. Try each click position in SCROLL_CLICK_POSITIONS (centre, 35%, 65%,
+       near scrollbar edge).
+    3. For every position: click-to-focus + fire all wheel methods
+       (pyautogui, SendInput, win32api).
+    4. Hash AFTER.  If changed → scroll succeeded, move to next section.
+    5. If no position produced a hash change → consecutive_failures += 1.
+    6. Stop after SCROLL_MAX_CONSECUTIVE_FAILURES consecutive failed cycles.
+
 This module does NOT:
+  - Use UI Automation ScrollPattern.
+  - Use heuristic pane scoring.
   - Type into any control.
-  - Click any control.
   - Interact with the right panel.
-  - Submit or modify the form in any way.
+  - Submit or modify the form.
 """
 
 from __future__ import annotations
@@ -21,10 +34,9 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
-import win32api
-import win32con
 from loguru import logger
 from PIL import ImageGrab
 
@@ -34,11 +46,10 @@ from config.settings import (
     LABEL_MAX_LENGTH,
     LABEL_MIN_LENGTH,
     LABEL_VALUE_SEPARATORS,
+    SCROLL_CLICK_POSITIONS,
     SCROLL_CLICKS_PER_STEP,
-    SCROLL_DEBUG_LEFT_AFTER,
-    SCROLL_DEBUG_LEFT_BEFORE,
-    SCROLL_DEBUG_RIGHT_AFTER,
-    SCROLL_DEBUG_RIGHT_BEFORE,
+    SCROLL_FAIL_DEBUG_DIR,
+    SCROLL_MAX_CONSECUTIVE_FAILURES,
     SCROLL_MAX_ITERATIONS,
     SCROLL_PAUSE_S,
 )
@@ -46,8 +57,9 @@ from automation.crop_region import compute_content_rect
 from automation.form_data_exporter import save_form_data_json, save_form_data_txt
 from automation.ocr_engine import OcrResult, run_ocr
 from automation.section_saver import save_crop_overlay, save_section_crop
+from automation.wheel_scroller import click_and_scroll
 from ui.inspector import BoundingRect, ControlInfo
-from ui.panel_locator import find_left_panel, find_scroll_target
+from ui.panel_locator import find_left_panel
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -70,22 +82,16 @@ class ReadResult:
     total_fields: int = 0
     duplicate_keys_overwritten: int = 0
     total_elapsed_s: float = 0.0
-    mean_confidence: float = 0.0   # average across all sections that returned text
+    mean_confidence: float = 0.0
     panel_found: bool = False
     success: bool = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Label / value parser
+# Label / value parser  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _split_line(line: str) -> Optional[tuple[str, str]]:
-    """
-    Attempt to split a single OCR text line into a (label, value) pair.
-
-    Tries each configured separator in order.  Returns None when no separator
-    is found or when the resulting label fails the length guard.
-    """
     for sep in LABEL_VALUE_SEPARATORS:
         if sep in line:
             label, _, value = line.partition(sep)
@@ -97,12 +103,6 @@ def _split_line(line: str) -> Optional[tuple[str, str]]:
 
 
 def parse_pairs(lines: list[str]) -> dict[str, str]:
-    """
-    Convert a list of OCR text lines into a label→value dictionary.
-
-    Lines that cannot be split are silently skipped (they may be headings,
-    decorative separators, or OCR noise).
-    """
     pairs: dict[str, str] = {}
     for line in lines:
         result = _split_line(line)
@@ -113,70 +113,11 @@ def parse_pairs(lines: list[str]) -> dict[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Scroll helpers  (mouse-wheel scroll, no click, no button press)
+# Image / hash helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _panel_centre(rect: BoundingRect) -> tuple[int, int]:
-    """Return the (x, y) screen coordinate of a rect's centre."""
-    return (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
-
-
-def _scroll_down(target_rect: BoundingRect, clicks: int) -> None:
-    """
-    Send a mouse-wheel scroll-down event positioned at the centre of
-    *target_rect*.  Uses win32api — no button clicks are generated.
-
-    The caller is responsible for passing the SCROLL TARGET rect, not the
-    panel rect or the OCR rect.  This guarantees the wheel event lands on
-    the correct control.
-    """
-    cx, cy = _panel_centre(target_rect)
-    win32api.SetCursorPos((cx, cy))
-    delta = -120 * clicks   # negative = scroll down
-    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, cx, cy, delta, 0)
-
-
-def _save_debug_image(rect: BoundingRect, path) -> None:
-    """
-    Capture the screen region *rect* and save it to *path*.
-    Silently logs errors — never raises.
-    """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        img = ImageGrab.grab(
-            bbox=(rect.left, rect.top, rect.right, rect.bottom),
-            all_screens=False,
-        )
-        img.save(str(path))
-        logger.debug("Debug image saved → {}", path)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not save debug image {}: {}", path, exc)
-
-
-def _right_panel_rect(
-    scroll_rect: BoundingRect,
-    root_rect: BoundingRect,
-) -> BoundingRect:
-    """
-    Derive an approximate bounding rect for the right panel.
-    Used only for saving side-by-side debug images — never scrolled.
-    The right panel is assumed to occupy the right half of *root_rect*
-    at the same vertical extent as *scroll_rect*.
-    """
-    mid = (root_rect.left + root_rect.right) // 2
-    return BoundingRect(
-        left=mid,
-        top=scroll_rect.top,
-        right=root_rect.right,
-        bottom=scroll_rect.bottom,
-    )
-
-
 def _sha256_of_region(rect: BoundingRect) -> str:
-    """
-    Capture the screen region *rect* and return its SHA-256 hex digest.
-    Using SHA-256 of raw pixel bytes gives collision-free change detection.
-    """
+    """SHA-256 of the raw pixel bytes of *rect* — collision-free change detection."""
     img = ImageGrab.grab(
         bbox=(rect.left, rect.top, rect.right, rect.bottom),
         all_screens=False,
@@ -184,145 +125,200 @@ def _sha256_of_region(rect: BoundingRect) -> str:
     return hashlib.sha256(img.tobytes()).hexdigest()
 
 
+def _save_image(rect: BoundingRect, path: Path) -> None:
+    """Capture *rect* and save to *path*. Logs errors, never raises."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img = ImageGrab.grab(
+            bbox=(rect.left, rect.top, rect.right, rect.bottom),
+            all_screens=False,
+        )
+        img.save(str(path))
+        logger.debug("Debug image → {}", path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not save debug image {}: {}", path, exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Click position resolution
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_click_positions(rect: BoundingRect) -> list[tuple[int, int]]:
+    """
+    Convert SCROLL_CLICK_POSITIONS fractional coordinates into absolute
+    (x, y) screen pixels within *rect*.
+    """
+    positions: list[tuple[int, int]] = []
+    for fx, fy in SCROLL_CLICK_POSITIONS:
+        x = int(rect.left + fx * rect.width)
+        y = int(rect.top  + fy * rect.height)
+        positions.append((x, y))
+    return positions
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Single-step scroll: try every click position until hash changes
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _attempt_scroll_step(
+    ocr_rect: BoundingRect,
+    step_index: int,
+    hash_before: str,
+) -> tuple[bool, str]:
+    """
+    Try to scroll the left panel by one step, cycling through all configured
+    click positions until the OCR-region hash changes.
+
+    Returns (scrolled: bool, hash_after: str).
+    Saves a debug image for every position that fails.
+    """
+    click_positions = _resolve_click_positions(ocr_rect)
+
+    for pos_idx, (cx, cy) in enumerate(click_positions):
+        attempt = click_and_scroll(cx, cy, SCROLL_CLICKS_PER_STEP)
+        time.sleep(SCROLL_PAUSE_S)
+
+        hash_after = _sha256_of_region(ocr_rect)
+
+        logger.debug(
+            "Scroll step {} pos [{}/{}] at ({},{}) — "
+            "pyautogui={} SendInput={} win32={} — "
+            "hash_before={:.8} hash_after={:.8} changed={}",
+            step_index,
+            pos_idx + 1,
+            len(click_positions),
+            cx, cy,
+            attempt["pyautogui_ok"],
+            attempt["sendinput_ok"],
+            attempt["win32_fallback_ok"],
+            hash_before,
+            hash_after,
+            hash_before != hash_after,
+        )
+
+        if hash_before != hash_after:
+            logger.debug(
+                "Scroll step {} succeeded at position [{}/{}] ({},{}).",
+                step_index, pos_idx + 1, len(click_positions), cx, cy,
+            )
+            return True, hash_after
+
+        # Save failure debug image
+        fail_path = SCROLL_FAIL_DEBUG_DIR / f"step{step_index:03d}_pos{pos_idx}.png"
+        _save_image(ocr_rect, fail_path)
+        logger.debug(
+            "Scroll step {} pos [{}/{}] failed — saved {}",
+            step_index, pos_idx + 1, len(click_positions), fail_path,
+        )
+
+    # All positions exhausted — hash still unchanged
+    return False, hash_before
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Core read loop
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Number of consecutive identical hashes that signals the bottom of the panel.
-_REPEAT_THRESHOLD: int = 3
-
-
-def _read_sections(
-    scroll_rect: BoundingRect,
-    scroll_target_rect: BoundingRect,
-    ocr_rect: BoundingRect,
-    root_rect: BoundingRect,
-) -> tuple[list[SectionResult], str]:
+def _read_sections(ocr_rect: BoundingRect) -> tuple[list[SectionResult], str]:
     """
-    Scroll through the left panel from top to bottom.
+    Scroll through the left panel from top to bottom, OCR-ing each view.
 
-    Parameters
-    ----------
-    scroll_rect        Full left-panel rect — used for SHA-256 change detection
-                       and the left-pane debug images.
-    scroll_target_rect Innermost scrollable container rect — the ONLY rect the
-                       wheel event is sent to.  Always strictly inside the left
-                       half of root_rect.
-    ocr_rect           Tight content crop — used for OCR and section PNGs.
-    root_rect          Root panel rect — used to derive the right-panel rect
-                       for debug images.
+    Uses only the OCR rect for both capture and scroll targeting:
+      - Hash is computed from the OCR rect (tight content region).
+      - Click positions are resolved within the OCR rect.
 
-    Termination (first that fires):
-      A. Pre-scroll hash == post-scroll hash  (panel did not move).
-      B. Same hash _REPEAT_THRESHOLD consecutive times  (stuck at bottom).
-      C. SCROLL_MAX_ITERATIONS exhausted  (safety cap).
+    Termination conditions (first that fires):
+      A. All SCROLL_CLICK_POSITIONS failed to change the hash for
+         SCROLL_MAX_CONSECUTIVE_FAILURES consecutive full cycles → bottom reached.
+      B. SCROLL_MAX_ITERATIONS exhausted (safety cap).
     """
     sections: list[SectionResult] = []
-    recent_hashes: list[str] = []
-    stop_reason: str = f"SCROLL_MAX_ITERATIONS ({SCROLL_MAX_ITERATIONS}) reached"
-    right_rect = _right_panel_rect(scroll_rect, root_rect)
+    consecutive_failures: int = 0
+    stop_reason = f"SCROLL_MAX_ITERATIONS ({SCROLL_MAX_ITERATIONS}) reached"
 
     for i in range(SCROLL_MAX_ITERATIONS):
 
-        # ── Save overlay once for visual audit ────────────────────────────────
+        # ── Save overlay on first iteration ───────────────────────────────────
         if i == 0:
             save_crop_overlay(ocr_rect)
 
-        # ── Save raw crop for this scroll position ────────────────────────────
+        # ── Save raw crop for this position ───────────────────────────────────
         save_section_crop(ocr_rect, i)
 
-        # ── OCR the tight content region ──────────────────────────────────────
+        # ── OCR ───────────────────────────────────────────────────────────────
         ocr_result = run_ocr(ocr_rect)
         pairs = parse_pairs(ocr_result.lines) if ocr_result.success else {}
         sections.append(SectionResult(scroll_index=i, ocr=ocr_result, pairs=pairs))
 
         logger.debug(
-            "Section {}: OCR success={}, lines={}, pairs={}, mean_conf={:.1f}",
+            "Section {}: OCR success={} lines={} pairs={} mean_conf={:.1f}",
             i, ocr_result.success,
             len(ocr_result.lines), len(pairs), ocr_result.mean_confidence,
         )
 
-        # ── Capture before-scroll debug images ───────────────────────────────
-        _save_debug_image(scroll_rect, SCROLL_DEBUG_LEFT_BEFORE)
-        _save_debug_image(right_rect,  SCROLL_DEBUG_RIGHT_BEFORE)
+        # ── Hash BEFORE scroll ────────────────────────────────────────────────
+        hash_before = _sha256_of_region(ocr_rect)
 
-        # ── Hash the LEFT panel BEFORE scrolling ──────────────────────────────
-        hash_before = _sha256_of_region(scroll_rect)
+        # ── Attempt scroll — try all click positions ──────────────────────────
+        scrolled, hash_after = _attempt_scroll_step(ocr_rect, i, hash_before)
 
-        # ── Scroll the correct (left) target only ─────────────────────────────
-        _scroll_down(scroll_target_rect, SCROLL_CLICKS_PER_STEP)
-        time.sleep(SCROLL_PAUSE_S)
-
-        # ── Capture after-scroll debug images ────────────────────────────────
-        _save_debug_image(scroll_rect, SCROLL_DEBUG_LEFT_AFTER)
-        _save_debug_image(right_rect,  SCROLL_DEBUG_RIGHT_AFTER)
-
-        # ── Hash the LEFT panel AFTER scrolling ───────────────────────────────
-        hash_after = _sha256_of_region(scroll_rect)
-
-        # ── Verify left pane actually moved ───────────────────────────────────
-        if hash_before == hash_after:
-            stop_reason = "Image hash unchanged (before == after scroll)"
-            logger.warning("Left pane did not move after scroll.")
-            logger.info(
-                "Bottom detected.  Reason: {}  |  "
-                "Sections read: {}  |  Fields extracted: {}",
-                stop_reason, len(sections),
-                sum(len(s.pairs) for s in sections),
+        if scrolled:
+            consecutive_failures = 0
+            logger.debug("Step {}: scroll confirmed (hash changed).", i)
+        else:
+            consecutive_failures += 1
+            logger.warning(
+                "Step {}: left pane did not move after scroll "
+                "(all {} positions tried, consecutive_failures={}/{}).",
+                i,
+                len(SCROLL_CLICK_POSITIONS),
+                consecutive_failures,
+                SCROLL_MAX_CONSECUTIVE_FAILURES,
             )
-            break
 
-        # ── Termination check B: same hash N times in a row ───────────────────
-        recent_hashes.append(hash_after)
-        if len(recent_hashes) > _REPEAT_THRESHOLD:
-            recent_hashes.pop(0)
-
-        if (
-            len(recent_hashes) == _REPEAT_THRESHOLD
-            and len(set(recent_hashes)) == 1
-        ):
-            stop_reason = (
-                f"Same hash repeated {_REPEAT_THRESHOLD} consecutive times"
-            )
-            logger.info(
-                "Bottom detected.  Reason: {}  |  "
-                "Sections read: {}  |  Fields extracted: {}",
-                stop_reason, len(sections),
-                sum(len(s.pairs) for s in sections),
-            )
-            break
+            if consecutive_failures >= SCROLL_MAX_CONSECUTIVE_FAILURES:
+                stop_reason = (
+                    f"Bottom reached — {consecutive_failures} consecutive "
+                    f"full-cycle scroll failures (all positions exhausted)"
+                )
+                logger.info(
+                    "Bottom detected.  Reason: {}  |  "
+                    "Sections read: {}  |  Fields extracted: {}",
+                    stop_reason,
+                    len(sections),
+                    sum(len(s.pairs) for s in sections),
+                )
+                break
 
     else:
         logger.warning(
             "Bottom detected.  Reason: {}  |  "
             "Sections read: {}  |  Fields extracted: {}",
-            stop_reason, len(sections),
+            stop_reason,
+            len(sections),
             sum(len(s.pairs) for s in sections),
         )
 
     return sections, stop_reason
 
 
-def _merge_sections(sections: list[SectionResult]) -> tuple[dict[str, str], int]:
-    """
-    Merge all per-section pair dicts into one dictionary.
-    Later sections overwrite earlier ones on key collision.
+# ══════════════════════════════════════════════════════════════════════════════
+# Merge
+# ══════════════════════════════════════════════════════════════════════════════
 
-    Returns (merged_dict, count_of_overwrites).
-    """
+def _merge_sections(sections: list[SectionResult]) -> tuple[dict[str, str], int]:
+    """Merge all per-section pairs; latest value wins on key collision."""
     merged: dict[str, str] = {}
     overwrites = 0
-
     for section in sections:
         for label, value in section.pairs.items():
             if label in merged:
                 overwrites += 1
                 logger.debug(
-                    "Duplicate key '{}': overwriting '{}' → '{}'",
+                    "Duplicate key '{}': '{}' → '{}'",
                     label, merged[label], value,
                 )
             merged[label] = value
-
     return merged, overwrites
 
 
@@ -334,13 +330,13 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
     """
     Entry point for Phase 3.
 
-    1. Locate the left panel node in *tree*.
-    2. Scroll through it, OCR-ing each visible section.
-    3. Parse and merge all label/value pairs.
-    4. Return a ReadResult with the merged data and full diagnostics.
+    1. Locate the left panel node in the ControlInfo snapshot.
+    2. Derive the tight OCR crop rect.
+    3. Scroll + OCR using click-to-focus wheel input.
+    4. Parse and merge all label/value pairs.
+    5. Return a ReadResult with full diagnostics.
 
-    On failure (panel not found, OCR entirely empty) returns a ReadResult
-    with success=False — never raises.
+    Never raises — returns ReadResult(success=False) on any fatal error.
     """
     t0 = time.monotonic()
 
@@ -360,12 +356,12 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
 
     rect = panel_node.bounding_rect
     logger.info(
-        "Starting left panel read: rect=({},{},{},{})  size={}x{}",
+        "Left panel: rect=({},{},{},{})  size={}x{}",
         rect.left, rect.top, rect.right, rect.bottom,
         rect.width, rect.height,
     )
 
-    # ── 2. Derive tight content crop rect ────────────────────────────────────
+    # ── 2. Derive tight OCR crop rect ─────────────────────────────────────────
     ocr_rect = compute_content_rect(panel_node)
     logger.info(
         "OCR crop rect: ({},{},{},{})  size={}x{}",
@@ -373,31 +369,21 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
         ocr_rect.width, ocr_rect.height,
     )
 
-    # ── 3. Find the innermost scrollable container in the left half ───────────
-    scroll_target = find_scroll_target(panel_node, tree.bounding_rect)
+    # ── 3. Scroll + OCR ───────────────────────────────────────────────────────
+    sections, stop_reason = _read_sections(ocr_rect)
 
-    # ── 4. Scroll + OCR ───────────────────────────────────────────────────────
-    sections, stop_reason = _read_sections(
-        scroll_rect=rect,
-        scroll_target_rect=scroll_target.bounding_rect,
-        ocr_rect=ocr_rect,
-        root_rect=tree.bounding_rect,
-    )
-
-    # ── 5. Aggregate confidence ───────────────────────────────────────────────
+    # ── 4. Aggregate confidence ───────────────────────────────────────────────
     successful = [s for s in sections if s.ocr.success]
     mean_conf = (
         sum(s.ocr.mean_confidence for s in successful) / len(successful)
-        if successful
-        else 0.0
+        if successful else 0.0
     )
 
-    # ── 6. Merge ──────────────────────────────────────────────────────────────
+    # ── 5. Merge ──────────────────────────────────────────────────────────────
     merged, overwrites = _merge_sections(sections)
-
     elapsed = time.monotonic() - t0
 
-    # ── 7. Log summary ────────────────────────────────────────────────────────
+    # ── 6. Log summary ────────────────────────────────────────────────────────
     logger.info("── Left panel read summary ───────────────────")
     logger.info("  Stop reason               : {}", stop_reason)
     logger.info("  Sections read             : {}", len(sections))
@@ -410,8 +396,8 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
 
     if not merged:
         logger.warning(
-            "OCR returned no parseable label/value pairs. "
-            "Check OCR confidence, Tesseract install, and panel detection."
+            "OCR returned no parseable pairs. "
+            "Check Tesseract install and panel detection."
         )
         return ReadResult(
             sections_read=len(sections),
@@ -435,11 +421,8 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
 
 def save_read_result(result: ReadResult) -> None:
     """
-    Persist the ReadResult's form_data to output/form_data.json and .txt.
-
-    Always writes both files — even when result.success is False or
-    form_data is empty — so the output directory is always populated
-    after every run and callers can inspect what (if anything) was captured.
+    Always writes output/form_data.json and output/form_data.txt —
+    even when result.success is False — so outputs are always present.
     """
     save_form_data_json(result.form_data, FORM_DATA_JSON)
     save_form_data_txt(result.form_data, FORM_DATA_TXT)
