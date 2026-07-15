@@ -3,13 +3,10 @@ Phase 3 — Left panel locator.
 
 Responsibilities:
   - Inspect the ControlInfo tree produced by Phase 1.
-  - Identify the left information panel using spatial heuristics:
-      * It is a Panel/Group/Pane whose horizontal centre lies in the LEFT half
-        of the root control's bounding rectangle.
-      * It has a positive-area bounding rectangle.
-      * Among all qualifying candidates, prefer the one with the largest area
-        (most content).
-  - Return the ControlInfo node so the caller can capture its screen region.
+  - Identify the left information panel using spatial heuristics.
+  - Identify the innermost scrollable container within that panel as the
+    precise scroll target — so wheel events never land on the right pane.
+  - Return ControlInfo nodes so callers can capture screen regions.
   - Never interact with the right panel.
   - Never raise — return None on failure and let the caller decide.
 """
@@ -34,6 +31,18 @@ _PANEL_TYPES: frozenset[str] = frozenset(
         "ScrollViewerControl",
         "ListControl",
         "DataGridControl",
+    }
+)
+
+# Control types that are themselves scrollable — preferred scroll targets.
+_SCROLLABLE_TYPES: frozenset[str] = frozenset(
+    {
+        "ScrollViewerControl",
+        "ListControl",
+        "DataGridControl",
+        "PaneControl",
+        "DocumentControl",
+        "CustomControl",
     }
 )
 
@@ -138,3 +147,66 @@ def find_left_panel(root: ControlInfo) -> Optional[ControlInfo]:
         candidates_found,
     )
     return best_node
+
+
+def find_scroll_target(
+    left_panel: ControlInfo,
+    root_rect: BoundingRect,
+) -> ControlInfo:
+    """
+    Find the innermost scrollable container that is:
+      - A descendant of *left_panel* (or *left_panel* itself).
+      - Strictly within the LEFT half of *root_rect*.
+      - Of a scrollable control type.
+      - Has positive area.
+
+    Selection priority:
+      1. Deepest node (highest depth) among scrollable types — the innermost
+         container is most likely the actual scrollable list, not a wrapper.
+      2. If no scrollable-typed descendant qualifies, fall back to the
+         left_panel node itself.
+
+    This guarantees wheel events land inside the left pane, never the right.
+    """
+    all_nodes = flatten_tree(left_panel)
+    root_mid = (root_rect.left + root_rect.right) / 2.0
+
+    candidates: list[ControlInfo] = []
+
+    for node in all_nodes:
+        r = node.bounding_rect
+        if not _has_area(r):
+            continue
+        if node.control_type not in _SCROLLABLE_TYPES:
+            continue
+        # Entire rect must be strictly left of the midpoint —
+        # right edge must not cross into the right half.
+        if r.right > root_mid:
+            continue
+        candidates.append(node)
+
+    if not candidates:
+        logger.warning(
+            "No scrollable child found strictly in left half — "
+            "falling back to left_panel node itself for scroll targeting."
+        )
+        _log_scroll_target(left_panel)
+        return left_panel
+
+    # Pick deepest (innermost) candidate; break ties by largest area.
+    best = max(candidates, key=lambda n: (n.depth, _area(n.bounding_rect)))
+    _log_scroll_target(best)
+    return best
+
+
+def _log_scroll_target(node: ControlInfo) -> None:
+    """Emit the required scroll-target identity log lines."""
+    r = node.bounding_rect
+    logger.info("Scrolling control:")
+    logger.info("  AutomationId  = {}", node.automation_id or "(none)")
+    logger.info("  ControlType   = {}", node.control_type)
+    logger.info(
+        "  BoundingRect  = ({}, {}, {}, {})  size={}x{}",
+        r.left, r.top, r.right, r.bottom,
+        r.width, r.height,
+    )

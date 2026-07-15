@@ -163,3 +163,12 @@ CROP_PADDING: int = 6
 # detected panel width.  Prevents the right input panel bleeding in when the
 # panel locator picks a container that spans both halves.
 CROP_MAX_WIDTH_FRACTION: float = 0.52   # use at most 52 % of panel width
+
+# =============================================================================
+# Phase 3.2 — Scroll target debug images
+# =============================================================================
+# Saved once per scroll step so the correct pane can be visually confirmed.
+SCROLL_DEBUG_LEFT_BEFORE:  Path = DEBUG_DIR / "left_before_scroll.png"
+SCROLL_DEBUG_LEFT_AFTER:   Path = DEBUG_DIR / "left_after_scroll.png"
+SCROLL_DEBUG_RIGHT_BEFORE: Path = DEBUG_DIR / "right_before_scroll.png"
+SCROLL_DEBUG_RIGHT_AFTER:  Path = DEBUG_DIR / "right_after_scroll.png"
