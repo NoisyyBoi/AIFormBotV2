@@ -38,8 +38,10 @@ from config.settings import (
     SCROLL_MAX_ITERATIONS,
     SCROLL_PAUSE_S,
 )
+from automation.crop_region import compute_content_rect
 from automation.form_data_exporter import save_form_data_json, save_form_data_txt
 from automation.ocr_engine import OcrResult, run_ocr
+from automation.section_saver import save_crop_overlay, save_section_crop
 from ui.inspector import BoundingRect, ControlInfo
 from ui.panel_locator import find_left_panel
 
@@ -150,9 +152,17 @@ def _sha256_of_region(rect: BoundingRect) -> str:
 _REPEAT_THRESHOLD: int = 3
 
 
-def _read_sections(rect: BoundingRect) -> tuple[list[SectionResult], str]:
+def _read_sections(
+    scroll_rect: BoundingRect,
+    ocr_rect: BoundingRect,
+) -> tuple[list[SectionResult], str]:
     """
-    Scroll through the panel at *rect* from top to bottom.
+    Scroll through the panel at *scroll_rect* from top to bottom.
+
+    *scroll_rect*  — the full panel rect; used only for scroll targeting and
+                     SHA-256 change detection.
+    *ocr_rect*     — the tight content crop rect; used for OCR capture and
+                     for saving per-section debug images.
 
     Termination conditions (whichever fires first):
       A. Pre-scroll hash == post-scroll hash on the same step
@@ -169,8 +179,15 @@ def _read_sections(rect: BoundingRect) -> tuple[list[SectionResult], str]:
 
     for i in range(SCROLL_MAX_ITERATIONS):
 
-        # ── OCR the current view ──────────────────────────────────────────────
-        ocr_result = run_ocr(rect)
+        # ── Save overlay once so the crop rect can be visually audited ────────
+        if i == 0:
+            save_crop_overlay(ocr_rect)
+
+        # ── Save the raw crop for this scroll position ────────────────────────
+        save_section_crop(ocr_rect, i)
+
+        # ── OCR the tight content region only ─────────────────────────────────
+        ocr_result = run_ocr(ocr_rect)
         pairs = parse_pairs(ocr_result.lines) if ocr_result.success else {}
         sections.append(SectionResult(scroll_index=i, ocr=ocr_result, pairs=pairs))
 
@@ -183,15 +200,15 @@ def _read_sections(rect: BoundingRect) -> tuple[list[SectionResult], str]:
             ocr_result.mean_confidence,
         )
 
-        # ── Hash the panel BEFORE scrolling ───────────────────────────────────
-        hash_before = _sha256_of_region(rect)
+        # ── Hash the FULL panel BEFORE scrolling (detects scroll movement) ────
+        hash_before = _sha256_of_region(scroll_rect)
 
         # ── Scroll one step down ──────────────────────────────────────────────
-        _scroll_down(rect, SCROLL_CLICKS_PER_STEP)
+        _scroll_down(scroll_rect, SCROLL_CLICKS_PER_STEP)
         time.sleep(SCROLL_PAUSE_S)
 
-        # ── Hash the panel AFTER scrolling ────────────────────────────────────
-        hash_after = _sha256_of_region(rect)
+        # ── Hash the FULL panel AFTER scrolling ───────────────────────────────
+        hash_after = _sha256_of_region(scroll_rect)
 
         # ── Termination check A: same step, before == after ───────────────────
         if hash_before == hash_after:
@@ -301,10 +318,18 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
         rect.width, rect.height,
     )
 
-    # ── 2. Scroll + OCR ───────────────────────────────────────────────────────
-    sections, stop_reason = _read_sections(rect)
+    # ── 2. Derive tight content crop rect ────────────────────────────────────
+    ocr_rect = compute_content_rect(panel_node)
+    logger.info(
+        "OCR crop rect: ({},{},{},{})  size={}x{}",
+        ocr_rect.left, ocr_rect.top, ocr_rect.right, ocr_rect.bottom,
+        ocr_rect.width, ocr_rect.height,
+    )
 
-    # ── 3. Aggregate confidence ───────────────────────────────────────────────
+    # ── 3. Scroll + OCR ───────────────────────────────────────────────────────
+    sections, stop_reason = _read_sections(rect, ocr_rect)
+
+    # ── 4. Aggregate confidence ───────────────────────────────────────────────
     successful = [s for s in sections if s.ocr.success]
     mean_conf = (
         sum(s.ocr.mean_confidence for s in successful) / len(successful)
@@ -312,12 +337,12 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
         else 0.0
     )
 
-    # ── 4. Merge ──────────────────────────────────────────────────────────────
+    # ── 5. Merge ──────────────────────────────────────────────────────────────
     merged, overwrites = _merge_sections(sections)
 
     elapsed = time.monotonic() - t0
 
-    # ── 5. Log summary ────────────────────────────────────────────────────────
+    # ── 6. Log summary ────────────────────────────────────────────────────────
     logger.info("── Left panel read summary ───────────────────")
     logger.info("  Stop reason               : {}", stop_reason)
     logger.info("  Sections read             : {}", len(sections))

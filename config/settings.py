@@ -132,3 +132,34 @@ LABEL_MIN_LENGTH: int = 2
 
 # Maximum label length (chars) — longer strings are treated as plain text, not labels.
 LABEL_MAX_LENGTH: int = 60
+
+# =============================================================================
+# Phase 3.1 — OCR Crop Region
+# =============================================================================
+
+# ── Section crop output ───────────────────────────────────────────────────────
+# Each scroll step's raw (pre-preprocessing) crop is saved here for inspection.
+OCR_SECTIONS_DIR: Path = DEBUG_DIR / "ocr_sections"
+
+# Overlay that shows the exact OCR rectangle drawn on a full screenshot.
+OCR_CROP_OVERLAY_PNG: Path = DEBUG_DIR / "ocr_crop_overlay.png"
+
+# ── Content-region inset (pixels) ─────────────────────────────────────────────
+# Applied to the raw panel bounding rect to strip borders, title bars, and
+# any decorative chrome before the content rect is computed from children.
+# Increase these if toolbar/title text still bleeds into OCR results.
+PANEL_INSET_TOP: int    = 30   # skip title bar / tab header
+PANEL_INSET_BOTTOM: int = 4    # skip bottom border
+PANEL_INSET_LEFT: int   = 4    # skip left border / shadow
+PANEL_INSET_RIGHT: int  = 4    # skip right border / shadow
+
+# ── Child-union crop margin (pixels) ─────────────────────────────────────────
+# After computing the union of all visible child bounding rects, expand
+# outward by this many pixels so text at the edges isn't clipped by Tesseract.
+CROP_PADDING: int = 6
+
+# ── Right-edge guard (pixels from panel left edge) ───────────────────────────
+# Hard cap: the OCR rect will never extend beyond this fraction of the
+# detected panel width.  Prevents the right input panel bleeding in when the
+# panel locator picks a container that spans both halves.
+CROP_MAX_WIDTH_FRACTION: float = 0.52   # use at most 52 % of panel width
