@@ -18,14 +18,15 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import win32api
 import win32con
-import win32gui
 from loguru import logger
+from PIL import ImageGrab
 
 from config.settings import (
     FORM_DATA_JSON,
@@ -127,50 +128,54 @@ def _scroll_down(rect: BoundingRect, clicks: int) -> None:
     win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, cx, cy, delta, 0)
 
 
-def _capture_screenshot_hash(rect: BoundingRect) -> int:
+def _sha256_of_region(rect: BoundingRect) -> str:
     """
-    Return a cheap integer hash of the current pixel content of *rect*.
-    Used to detect whether the panel has actually scrolled (content changed).
+    Capture the screen region defined by *rect* and return its SHA-256 hex
+    digest.  Using SHA-256 of raw PNG bytes eliminates false positives that
+    plagued the old integer-sum approach.
     """
-    from PIL import ImageGrab
-    import numpy as np
     img = ImageGrab.grab(
         bbox=(rect.left, rect.top, rect.right, rect.bottom),
         all_screens=False,
     )
-    arr = np.array(img)
-    # Downsample to a coarse grid for speed, then sum
-    return int(arr[::8, ::8].sum())
+    # tobytes() gives the raw pixel buffer — fast and deterministic.
+    return hashlib.sha256(img.tobytes()).hexdigest()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Core read loop
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _read_sections(rect: BoundingRect) -> list[SectionResult]:
+# Number of consecutive identical hashes that signals the bottom of the panel.
+_REPEAT_THRESHOLD: int = 3
+
+
+def _read_sections(rect: BoundingRect) -> tuple[list[SectionResult], str]:
     """
     Scroll through the panel at *rect* from top to bottom.
 
-    Algorithm:
-      1. OCR the current view → parse pairs → record section.
-      2. Scroll down by SCROLL_CLICKS_PER_STEP.
-      3. Wait SCROLL_PAUSE_S for the panel to repaint.
-      4. Hash the new pixel content.
-      5. If the hash equals the previous hash → content did not change →
-         we have reached the bottom.  Stop.
-      6. Repeat up to SCROLL_MAX_ITERATIONS times (safety cap).
+    Termination conditions (whichever fires first):
+      A. Pre-scroll hash == post-scroll hash on the same step
+         (panel did not move at all after scrolling).
+      B. The same hash has appeared _REPEAT_THRESHOLD consecutive times
+         (panel is stuck / already at bottom for several steps).
+      C. SCROLL_MAX_ITERATIONS is exhausted (safety cap).
+
+    Returns (sections, stop_reason_string).
     """
     sections: list[SectionResult] = []
-    prev_hash: Optional[int] = None
+    recent_hashes: list[str] = []   # rolling window of post-scroll hashes
+    stop_reason: str = f"SCROLL_MAX_ITERATIONS ({SCROLL_MAX_ITERATIONS}) reached"
 
     for i in range(SCROLL_MAX_ITERATIONS):
+
+        # ── OCR the current view ──────────────────────────────────────────────
         ocr_result = run_ocr(rect)
         pairs = parse_pairs(ocr_result.lines) if ocr_result.success else {}
         sections.append(SectionResult(scroll_index=i, ocr=ocr_result, pairs=pairs))
 
         logger.debug(
-            "Section {}: OCR success={}, lines={}, pairs={}, "
-            "mean_conf={:.1f}",
+            "Section {}: OCR success={}, lines={}, pairs={}, mean_conf={:.1f}",
             i,
             ocr_result.success,
             len(ocr_result.lines),
@@ -178,28 +183,60 @@ def _read_sections(rect: BoundingRect) -> list[SectionResult]:
             ocr_result.mean_confidence,
         )
 
-        # Scroll down
+        # ── Hash the panel BEFORE scrolling ───────────────────────────────────
+        hash_before = _sha256_of_region(rect)
+
+        # ── Scroll one step down ──────────────────────────────────────────────
         _scroll_down(rect, SCROLL_CLICKS_PER_STEP)
         time.sleep(SCROLL_PAUSE_S)
 
-        # Check whether the view changed
-        current_hash = _capture_screenshot_hash(rect)
-        if prev_hash is not None and current_hash == prev_hash:
+        # ── Hash the panel AFTER scrolling ────────────────────────────────────
+        hash_after = _sha256_of_region(rect)
+
+        # ── Termination check A: same step, before == after ───────────────────
+        if hash_before == hash_after:
+            stop_reason = "Image hash unchanged (before == after scroll)"
             logger.info(
-                "Scroll bottom reached after {} section(s) "
-                "(content unchanged at step {}).",
+                "Bottom detected.  Reason: {}  |  "
+                "Sections read: {}  |  Fields extracted: {}",
+                stop_reason,
                 len(sections),
-                i + 1,
+                sum(len(s.pairs) for s in sections),
             )
             break
-        prev_hash = current_hash
+
+        # ── Termination check B: same hash repeated N times in a row ──────────
+        recent_hashes.append(hash_after)
+        if len(recent_hashes) > _REPEAT_THRESHOLD:
+            recent_hashes.pop(0)
+
+        if (
+            len(recent_hashes) == _REPEAT_THRESHOLD
+            and len(set(recent_hashes)) == 1
+        ):
+            stop_reason = (
+                f"Same hash repeated {_REPEAT_THRESHOLD} consecutive times"
+            )
+            logger.info(
+                "Bottom detected.  Reason: {}  |  "
+                "Sections read: {}  |  Fields extracted: {}",
+                stop_reason,
+                len(sections),
+                sum(len(s.pairs) for s in sections),
+            )
+            break
+
     else:
+        # Loop exhausted SCROLL_MAX_ITERATIONS without an early break.
         logger.warning(
-            "Reached SCROLL_MAX_ITERATIONS ({}) — stopping scroll loop.",
-            SCROLL_MAX_ITERATIONS,
+            "Bottom detected.  Reason: {}  |  "
+            "Sections read: {}  |  Fields extracted: {}",
+            stop_reason,
+            len(sections),
+            sum(len(s.pairs) for s in sections),
         )
 
-    return sections
+    return sections, stop_reason
 
 
 def _merge_sections(sections: list[SectionResult]) -> tuple[dict[str, str], int]:
@@ -265,7 +302,7 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
     )
 
     # ── 2. Scroll + OCR ───────────────────────────────────────────────────────
-    sections = _read_sections(rect)
+    sections, stop_reason = _read_sections(rect)
 
     # ── 3. Aggregate confidence ───────────────────────────────────────────────
     successful = [s for s in sections if s.ocr.success]
@@ -282,6 +319,7 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
 
     # ── 5. Log summary ────────────────────────────────────────────────────────
     logger.info("── Left panel read summary ───────────────────")
+    logger.info("  Stop reason               : {}", stop_reason)
     logger.info("  Sections read             : {}", len(sections))
     logger.info("  Sections with OCR text    : {}", len(successful))
     logger.info("  Fields extracted          : {}", len(merged))
@@ -318,8 +356,10 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
 def save_read_result(result: ReadResult) -> None:
     """
     Persist the ReadResult's form_data to output/form_data.json and .txt.
-    Saves empty-dict files even when result.success is False so the output
-    directory is always populated after a run.
+
+    Always writes both files — even when result.success is False or
+    form_data is empty — so the output directory is always populated
+    after every run and callers can inspect what (if anything) was captured.
     """
     save_form_data_json(result.form_data, FORM_DATA_JSON)
     save_form_data_txt(result.form_data, FORM_DATA_TXT)
