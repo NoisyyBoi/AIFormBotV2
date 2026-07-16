@@ -185,10 +185,6 @@ SCROLL_DEBUG_RIGHT_AFTER:  Path = DEBUG_DIR / "right_after_scroll.png"
 SCROLLABLE_CONTROLS_JSON:        Path = DEBUG_DIR / "scrollable_controls.json"
 SCROLLABLE_CONTROLS_OVERLAY_PNG: Path = DEBUG_DIR / "scrollable_controls_overlay.png"
 
-# ── Final OCR region debug image ──────────────────────────────────────────────
-# Shows exactly what Tesseract is reading — saved once before the first OCR.
-FINAL_OCR_REGION_PNG: Path = DEBUG_DIR / "final_ocr_region.png"
-
 # =============================================================================
 # Phase 3.3 — Click-to-focus + wheel scroll
 # =============================================================================
