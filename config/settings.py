@@ -203,6 +203,9 @@ SCROLL_CLICK_POSITIONS: list[tuple[float, float]] = [
 # any hash change) before the scroll loop gives up.
 SCROLL_MAX_CONSECUTIVE_FAILURES: int = 2
 
+# Consecutive sections that add zero new fields before declaring end-of-data.
+NO_NEW_FIELDS_THRESHOLD: int = 3
+
 # Debug images for failed scroll attempts are saved here.
 SCROLL_FAIL_DEBUG_DIR: Path = DEBUG_DIR / "scroll_failures"
 

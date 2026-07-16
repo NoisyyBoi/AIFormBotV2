@@ -46,6 +46,7 @@ from config.settings import (
     LABEL_MAX_LENGTH,
     LABEL_MIN_LENGTH,
     LABEL_VALUE_SEPARATORS,
+    NO_NEW_FIELDS_THRESHOLD,
     OCR_BOTTOM_CROP_PERCENT,
     SCROLL_CLICK_POSITIONS,
     SCROLL_CLICKS_PER_STEP,
@@ -252,13 +253,34 @@ def _attempt_scroll_step(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Incremental merge helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _merge_into(
+    accumulated: dict[str, str],
+    new_pairs: dict[str, str],
+) -> int:
+    """
+    Merge *new_pairs* into *accumulated* in place.
+    Returns the number of keys that were genuinely NEW (not previously seen).
+    Keys already present are overwritten silently (latest value wins).
+    """
+    new_count = 0
+    for label, value in new_pairs.items():
+        if label not in accumulated:
+            new_count += 1
+        accumulated[label] = value
+    return new_count
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Core read loop
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _read_sections(
     ocr_rect: BoundingRect,
     original_rect: BoundingRect,
-) -> tuple[list[SectionResult], str]:
+) -> tuple[list[SectionResult], dict[str, str], str]:
     """
     Scroll through the left panel from top to bottom, OCR-ing each view.
 
@@ -271,12 +293,19 @@ def _read_sections(
                   so the overlay shows both rectangles.
 
     Termination conditions (first that fires):
-      A. All SCROLL_CLICK_POSITIONS failed to change the hash for
-         SCROLL_MAX_CONSECUTIVE_FAILURES consecutive full cycles → bottom reached.
-      B. SCROLL_MAX_ITERATIONS exhausted (safety cap).
+      A. NO_NEW_FIELDS_THRESHOLD consecutive sections add zero new fields
+         → end of data reached.
+      B. All SCROLL_CLICK_POSITIONS failed to change the hash for
+         SCROLL_MAX_CONSECUTIVE_FAILURES consecutive full cycles
+         → scroll bottom reached.
+      C. SCROLL_MAX_ITERATIONS exhausted (safety cap).
+
+    Returns (sections, accumulated_fields, stop_reason).
     """
     sections: list[SectionResult] = []
-    consecutive_failures: int = 0
+    accumulated: dict[str, str] = {}          # running merged dictionary
+    consecutive_failures: int = 0             # scroll failures
+    consecutive_no_new_fields: int = 0        # end-of-data detector
     stop_reason = f"SCROLL_MAX_ITERATIONS ({SCROLL_MAX_ITERATIONS}) reached"
 
     for i in range(SCROLL_MAX_ITERATIONS):
@@ -298,6 +327,37 @@ def _read_sections(
             i, ocr_result.success,
             len(ocr_result.lines), len(pairs), ocr_result.mean_confidence,
         )
+
+        # ── Incremental merge + new-field tracking ────────────────────────────
+        new_keys = _merge_into(accumulated, pairs)
+
+        if new_keys > 0:
+            consecutive_no_new_fields = 0
+            logger.debug(
+                "Section {}: {} new field(s) added  (total={}).",
+                i, new_keys, len(accumulated),
+            )
+            # Incremental save after every successful merge
+            save_form_data_json(accumulated, FORM_DATA_JSON)
+            save_form_data_txt(accumulated, FORM_DATA_TXT)
+        else:
+            consecutive_no_new_fields += 1
+            logger.debug(
+                "Section {}: 0 new fields  "
+                "(consecutive_no_new_fields={}/{}).",
+                i, consecutive_no_new_fields, NO_NEW_FIELDS_THRESHOLD,
+            )
+
+        # ── End-of-data check ─────────────────────────────────────────────────
+        if consecutive_no_new_fields >= NO_NEW_FIELDS_THRESHOLD:
+            stop_reason = (
+                f"No new fields found for {NO_NEW_FIELDS_THRESHOLD} "
+                f"consecutive sections. End of data reached."
+            )
+            logger.info(stop_reason)
+            save_form_data_json(accumulated, FORM_DATA_JSON)
+            save_form_data_txt(accumulated, FORM_DATA_TXT)
+            break
 
         # ── Hash BEFORE scroll ────────────────────────────────────────────────
         hash_before = _sha256_of_region(ocr_rect)
@@ -329,7 +389,7 @@ def _read_sections(
                     "Sections read: {}  |  Fields extracted: {}",
                     stop_reason,
                     len(sections),
-                    sum(len(s.pairs) for s in sections),
+                    len(accumulated),
                 )
                 break
 
@@ -339,10 +399,10 @@ def _read_sections(
             "Sections read: {}  |  Fields extracted: {}",
             stop_reason,
             len(sections),
-            sum(len(s.pairs) for s in sections),
+            len(accumulated),
         )
 
-    return sections, stop_reason
+    return sections, accumulated, stop_reason
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -428,7 +488,7 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
     # ── 3. Scroll + OCR ───────────────────────────────────────────────────────
     # active_rect is used for OCR, SHA-256 hashing, and debug screenshots.
     # ocr_rect is passed to save_crop_overlay only so the overlay shows both.
-    sections, stop_reason = _read_sections(active_rect, ocr_rect)
+    sections, accumulated, stop_reason = _read_sections(active_rect, ocr_rect)
 
     # ── 4. Aggregate confidence ───────────────────────────────────────────────
     successful = [s for s in sections if s.ocr.success]
@@ -437,8 +497,9 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
         if successful else 0.0
     )
 
-    # ── 5. Merge ──────────────────────────────────────────────────────────────
-    merged, overwrites = _merge_sections(sections)
+    # ── 5. Count overwrites for the summary log ───────────────────────────────
+    # accumulated was built incrementally; compute overwrites from sections.
+    _, overwrites = _merge_sections(sections)
     elapsed = time.monotonic() - t0
 
     # ── 6. Log summary ────────────────────────────────────────────────────────
@@ -446,13 +507,13 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
     logger.info("  Stop reason               : {}", stop_reason)
     logger.info("  Sections read             : {}", len(sections))
     logger.info("  Sections with OCR text    : {}", len(successful))
-    logger.info("  Fields extracted          : {}", len(merged))
+    logger.info("  Fields extracted          : {}", len(accumulated))
     logger.info("  Duplicate keys overwritten: {}", overwrites)
     logger.info("  Mean OCR confidence       : {:.1f}", mean_conf)
     logger.info("  Total time                : {:.2f}s", elapsed)
     logger.info("─────────────────────────────────────────────")
 
-    if not merged:
+    if not accumulated:
         logger.warning(
             "OCR returned no parseable pairs. "
             "Check Tesseract install and panel detection."
@@ -466,9 +527,9 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
         )
 
     return ReadResult(
-        form_data=merged,
+        form_data=accumulated,
         sections_read=len(sections),
-        total_fields=len(merged),
+        total_fields=len(accumulated),
         duplicate_keys_overwritten=overwrites,
         total_elapsed_s=elapsed,
         mean_confidence=mean_conf,
