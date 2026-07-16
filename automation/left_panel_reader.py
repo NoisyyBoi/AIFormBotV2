@@ -39,8 +39,11 @@ from typing import Optional
 
 from loguru import logger
 from PIL import ImageGrab
+import cv2
+import numpy as np
 
 from config.settings import (
+    DEBUG_DIR,
     FORM_DATA_JSON,
     FORM_DATA_TXT,
     LABEL_MAX_LENGTH,
@@ -194,6 +197,98 @@ def _resolve_click_positions(rect: BoundingRect) -> list[tuple[int, int]]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Scroll debug visualiser  (logging + screenshot only — no behaviour change)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SCROLL_TARGET_PNG = DEBUG_DIR / "scroll_target.png"
+
+
+def _save_scroll_target_debug(
+    ocr_rect: BoundingRect,
+    click_x: int,
+    click_y: int,
+    step_index: int,
+) -> None:
+    """
+    Log rectangle and click-point details, then save debug/scroll_target.png.
+
+    Drawn layers (full-screen screenshot):
+      - OCR rect      → green rectangle
+      - Scroll rect   → blue rectangle  (= ocr_rect; click positions derived from it)
+      - Click point   → red filled circle
+
+    This is called once per scroll step (position 0 only) and overwrites
+    the same file each time so the latest state is always visible.
+    Does NOT change any scroll, hash, or OCR behaviour.
+    """
+    # ── Log all three rects + click point ────────────────────────────────────
+    logger.debug("── Scroll debug (step {}) ────────────────────", step_index)
+    logger.debug(
+        "  Scroll rect  (click source) : ({},{},{},{})  size={}x{}",
+        ocr_rect.left, ocr_rect.top, ocr_rect.right, ocr_rect.bottom,
+        ocr_rect.width, ocr_rect.height,
+    )
+    logger.debug(
+        "  OCR rect     (same rect)    : ({},{},{},{})  size={}x{}",
+        ocr_rect.left, ocr_rect.top, ocr_rect.right, ocr_rect.bottom,
+        ocr_rect.width, ocr_rect.height,
+    )
+    logger.debug(
+        "  Hash rect    (same rect)    : ({},{},{},{})  size={}x{}",
+        ocr_rect.left, ocr_rect.top, ocr_rect.right, ocr_rect.bottom,
+        ocr_rect.width, ocr_rect.height,
+    )
+    logger.debug("  Mouse click point           : ({},{})", click_x, click_y)
+    logger.debug("─────────────────────────────────────────────")
+
+    # ── Save annotated screenshot ─────────────────────────────────────────────
+    try:
+        _SCROLL_TARGET_PNG.parent.mkdir(parents=True, exist_ok=True)
+        pil_img = ImageGrab.grab(all_screens=False)
+        bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+        # OCR rect — green
+        cv2.rectangle(
+            bgr,
+            (ocr_rect.left, ocr_rect.top),
+            (ocr_rect.right, ocr_rect.bottom),
+            (0, 255, 0), 2,
+        )
+        cv2.putText(
+            bgr, "OCR",
+            (ocr_rect.left + 4, ocr_rect.top + 16),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
+        )
+
+        # Scroll rect — blue (same rect, drawn slightly inset so both are visible)
+        cv2.rectangle(
+            bgr,
+            (ocr_rect.left + 3, ocr_rect.top + 3),
+            (ocr_rect.right - 3, ocr_rect.bottom - 3),
+            (255, 80, 0), 2,
+        )
+        cv2.putText(
+            bgr, "SCROLL",
+            (ocr_rect.left + 4, ocr_rect.top + 32),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 0), 1, cv2.LINE_AA,
+        )
+
+        # Click point — red filled circle
+        cv2.circle(bgr, (click_x, click_y), 8, (0, 0, 255), -1)
+        cv2.circle(bgr, (click_x, click_y), 8, (255, 255, 255), 1)
+        cv2.putText(
+            bgr, f"click ({click_x},{click_y})",
+            (click_x + 12, click_y + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA,
+        )
+
+        cv2.imwrite(str(_SCROLL_TARGET_PNG), bgr)
+        logger.debug("Scroll target debug image saved → {}", _SCROLL_TARGET_PNG)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not save scroll target debug image: {}", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Single-step scroll: try every click position until hash changes
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -212,6 +307,10 @@ def _attempt_scroll_step(
     click_positions = _resolve_click_positions(ocr_rect)
 
     for pos_idx, (cx, cy) in enumerate(click_positions):
+        # ── Debug logging + screenshot (first position only, no behaviour change)
+        if pos_idx == 0:
+            _save_scroll_target_debug(ocr_rect, cx, cy, step_index)
+
         attempt = click_and_scroll(cx, cy, SCROLL_CLICKS_PER_STEP)
         time.sleep(SCROLL_PAUSE_S)
 
