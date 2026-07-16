@@ -41,6 +41,7 @@ from loguru import logger
 from PIL import ImageGrab
 
 from config.settings import (
+    FINAL_OCR_REGION_PNG,
     FORM_DATA_JSON,
     FORM_DATA_TXT,
     LABEL_MAX_LENGTH,
@@ -173,6 +174,39 @@ def _apply_bottom_crop(rect: BoundingRect) -> BoundingRect:
         top=rect.top,
         right=rect.right,
         bottom=new_bottom,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Right-edge clamp — uses the true left-panel boundary from UI inspection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _clamp_right_to_panel(
+    rect: BoundingRect,
+    panel_right: int,
+) -> BoundingRect:
+    """
+    Ensure *rect* does not extend beyond *panel_right*.
+
+    *panel_right* is the actual right edge of the detected left panel as
+    reported by UI Automation — the authoritative boundary between the left
+    source panel and the right entry panel.  Using this avoids any fixed-
+    percentage guesswork.
+
+    Returns *rect* unchanged when it already fits within the boundary.
+    """
+    if rect.right <= panel_right:
+        return rect
+
+    logger.debug(
+        "Right-edge clamped to panel boundary: {} → {}  (saved {} px).",
+        rect.right, panel_right, rect.right - panel_right,
+    )
+    return BoundingRect(
+        left=rect.left,
+        top=rect.top,
+        right=panel_right,
+        bottom=rect.bottom,
     )
 
 
@@ -484,6 +518,26 @@ def read_left_panel(tree: ControlInfo) -> ReadResult:
         active_rect.width, active_rect.height,
     )
     logger.info("Crop percentage   : {:.0%}", OCR_BOTTOM_CROP_PERCENT)
+
+    # ── 2c. Clamp right edge to the true left-panel boundary ──────────────────
+    # panel_node.bounding_rect.right is the authoritative right edge of the
+    # left panel as reported by UI Automation.  Clamping here guarantees that
+    # no pixel from the right entry panel ever enters the OCR region.
+    active_rect = _clamp_right_to_panel(active_rect, panel_node.bounding_rect.right)
+
+    logger.debug(
+        "OCR region: Left={} Top={} Right={} Bottom={} Width={} Height={}",
+        active_rect.left,
+        active_rect.top,
+        active_rect.right,
+        active_rect.bottom,
+        active_rect.width,
+        active_rect.height,
+    )
+
+    # Save one debug image showing exactly what Tesseract will read.
+    _save_image(active_rect, FINAL_OCR_REGION_PNG)
+    logger.debug("Final OCR region image saved → {}", FINAL_OCR_REGION_PNG)
 
     # ── 3. Scroll + OCR ───────────────────────────────────────────────────────
     # active_rect is used for OCR, SHA-256 hashing, and debug screenshots.
