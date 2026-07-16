@@ -25,6 +25,7 @@ import win32api
 import win32con
 from loguru import logger
 
+from automation.mouse_logger import log_move
 from config.settings import SCROLL_CLICK_PAUSE_S, SCROLL_CLICKS_PER_STEP
 
 # ── Try importing pyautogui — it may not be installed yet ────────────────────
@@ -137,9 +138,12 @@ def click_and_scroll(
 
     # ── 1. Move cursor and left-click to focus ────────────────────────────────
     try:
+        log_move(x, y)                                          # MOVE: SetCursorPos
         win32api.SetCursorPos((x, y))
         time.sleep(0.05)
+        log_move(x, y)                                          # MOVE: LEFTDOWN
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, x, y, 0, 0)
+        log_move(x, y)                                          # MOVE: LEFTUP
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP,   x, y, 0, 0)
         time.sleep(SCROLL_CLICK_PAUSE_S)
     except Exception as exc:  # noqa: BLE001
@@ -148,6 +152,7 @@ def click_and_scroll(
     # ── 2. pyautogui scroll (primary) ────────────────────────────────────────
     if _PYAUTOGUI_AVAILABLE:
         try:
+            log_move(x, y)                                      # MOVE: pyautogui.scroll
             pyautogui.scroll(-clicks, x=x, y=y)
             pyautogui_ok = True
         except Exception as exc:  # noqa: BLE001
@@ -159,6 +164,7 @@ def click_and_scroll(
     # ── 4. win32api fallback ──────────────────────────────────────────────────
     try:
         delta = -(win32con.WHEEL_DELTA * clicks)
+        log_move(x, y)                                          # MOVE: mouse_event WHEEL
         win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, x, y, delta & 0xFFFF, 0)
         win32_ok = True
     except Exception as exc:  # noqa: BLE001
